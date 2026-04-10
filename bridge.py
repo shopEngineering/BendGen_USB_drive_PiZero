@@ -63,8 +63,23 @@ EJECT_WAIT_SECONDS = 1.0  # let the kernel fully release the backing file
 # ── Gadget helpers ───────────────────────────────────────────────────────
 
 def _sysfs_write(path, value):
-    """Write a value to a sysfs file."""
-    Path(path).write_text(str(value))
+    """Write a value to a sysfs file using low-level I/O.
+
+    We bypass Python's buffered text-mode `write_text` for two reasons:
+
+    1. Empty-string writes through buffered I/O may never issue a real
+       `write(2)` syscall — the buffer is empty, nothing gets flushed,
+       and the kernel never hears about it. That breaks sysfs knobs
+       where an empty write has a meaning (e.g. unbind the UDC).
+    2. Sysfs parsers conventionally expect a trailing newline. Without
+       it, some attribute stores reject the input or misparse.
+    """
+    data = (str(value) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
 
 
 def _sysfs_read(path):
