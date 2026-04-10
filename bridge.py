@@ -18,9 +18,12 @@ Implementation notes:
   eject needed, so the Titan continues to see the drive uninterrupted.
 
 - Writes (deploy) use mtools (mdel + mcopy) to manipulate the FAT
-  image directly, after ejecting the gadget. This sidesteps the
-  loop-mount timing race where the kernel doesn't immediately release
-  the backing file after eject, which manifests as EBUSY on mount.
+  image directly, between a USB Device Controller unbind and rebind.
+  Unbinding the UDC is a hardware-level disconnect — below the SCSI
+  layer — so it isn't blocked by PREVENT MEDIUM REMOVAL when the
+  host has the drive mounted. It also releases the backing file so
+  mtools has clean access. Write-then-rebind presents the Titan with
+  a fresh USB device containing the new file.
 """
 
 import os
@@ -78,22 +81,53 @@ def gadget_is_active():
     return bool(current)
 
 
-def eject_media():
-    """Tell the host (Titan) the media has been removed and unbind the
-    backing file so we can safely write to it locally.
-    """
-    # forced_eject isn't available on every kernel — tolerate failure
+UDC_PATH = "/sys/kernel/config/usb_gadget/g1/UDC"
+UDC_SYSFS = Path("/sys/class/udc")
+
+
+def _current_udc():
+    """Return the first available USB Device Controller name, or None."""
     try:
-        _sysfs_write(f"{GADGET_LUN}/forced_eject", "")
-    except OSError:
-        pass
-    _sysfs_write(f"{GADGET_LUN}/file", "")
+        udcs = sorted(p.name for p in UDC_SYSFS.iterdir())
+        return udcs[0] if udcs else None
+    except FileNotFoundError:
+        return None
+
+
+def usb_disconnect():
+    """Unbind the gadget from its USB Device Controller.
+
+    This is a hardware-level disconnect — to the Titan it looks like the
+    USB cable was unplugged. Unlike writing to the LUN's `file` or
+    `forced_eject` sysfs entries, this is NOT subject to SCSI PREVENT
+    MEDIUM REMOVAL, so it works even while the host has the drive
+    mounted and locked.
+
+    Also has the side effect of releasing the backing file, so mtools
+    can safely read/write the image afterward.
+    """
+    _sysfs_write(UDC_PATH, "")
     time.sleep(EJECT_WAIT_SECONDS)
 
 
-def insert_media():
-    """Re-present the image to the host (Titan)."""
-    _sysfs_write(f"{GADGET_LUN}/file", USB_IMAGE)
+def usb_reconnect(udc_name=None):
+    """Rebind the gadget to the UDC — the Titan sees a fresh USB device.
+
+    Also rebinds the backing file in case the unbind cleared it.
+    """
+    # Ensure the LUN has the image bound before we come back online
+    current_file = _sysfs_read(f"{GADGET_LUN}/file") or ""
+    if current_file != USB_IMAGE:
+        try:
+            _sysfs_write(f"{GADGET_LUN}/file", USB_IMAGE)
+        except OSError:
+            pass
+
+    if not udc_name:
+        udc_name = _current_udc()
+    if not udc_name:
+        raise RuntimeError("No USB device controller available to rebind")
+    _sysfs_write(UDC_PATH, udc_name)
     time.sleep(0.3)
 
 
@@ -166,7 +200,10 @@ def status():
 def deploy():
     """Receive a file, write it to the USB image, re-present to host.
 
-    Flow: eject → mtools clear root → mtools copy new file → reinsert.
+    Flow: USB disconnect (UDC unbind) → mtools clear + copy → USB
+    reconnect. Unbinding the UDC is a hardware-level disconnect that
+    isn't blocked by SCSI PREVENT MEDIUM REMOVAL, and it releases the
+    backing file so mtools has clean access.
     """
     if "file" not in request.files:
         return jsonify({"ok": False, "error": "No file uploaded"}), 400
@@ -187,21 +224,24 @@ def deploy():
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
+    # Remember which UDC we were bound to before we disconnect
+    udc_name = _current_udc()
+
     try:
-        eject_media()
+        usb_disconnect()
         mtools_clear_root()
         mtools_copy_to_image(tmp_path, filename)
-        insert_media()
+        usb_reconnect(udc_name)
         return jsonify({"ok": True, "filename": filename, "size": len(file_bytes)})
 
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode("utf-8", errors="replace") if isinstance(e.stderr, (bytes, bytearray)) else (e.stderr or "")
-        try: insert_media()
+        try: usb_reconnect(udc_name)
         except Exception: pass
         return jsonify({"ok": False, "error": f"mtools failed: {stderr.strip() or str(e)}"}), 500
 
     except Exception as e:
-        try: insert_media()
+        try: usb_reconnect(udc_name)
         except Exception: pass
         return jsonify({"ok": False, "error": str(e)}), 500
 
