@@ -9,11 +9,21 @@ Endpoints:
     POST /api/deploy           — upload a ZIP, write it to the USB image
     GET  /api/backups          — list files currently on the USB image
     GET  /api/backup/<name>    — download a file from the USB image
-    POST /api/sync-from-titan  — eject, mount, read files written by Titan
+
+Implementation notes:
+
+- Reads (list + download) use a read-only loop mount of the backing
+  file. This coexists with the gadget (which has the file open
+  read-write) because Linux allows additional read-only opens. No
+  eject needed, so the Titan continues to see the drive uninterrupted.
+
+- Writes (deploy) use mtools (mdel + mcopy) to manipulate the FAT
+  image directly, after ejecting the gadget. This sidesteps the
+  loop-mount timing race where the kernel doesn't immediately release
+  the backing file after eject, which manifests as EBUSY on mount.
 """
 
 import os
-import shutil
 import subprocess
 import tempfile
 import time
@@ -33,6 +43,7 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
 
+
 # --- Configuration ---
 USB_IMAGE = os.environ.get("USB_IMAGE", "/piusb.bin")
 USB_IMAGE_SIZE_MB = int(os.environ.get("USB_IMAGE_SIZE_MB", "512"))
@@ -43,6 +54,7 @@ GADGET_LUN = os.environ.get(
 MOUNT_POINT = os.environ.get("MOUNT_POINT", "/mnt/usb_image")
 ALLOWED_EXTENSIONS = {".zip"}
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+EJECT_WAIT_SECONDS = 1.0  # let the kernel fully release the backing file
 
 
 # ── Gadget helpers ───────────────────────────────────────────────────────
@@ -67,11 +79,16 @@ def gadget_is_active():
 
 
 def eject_media():
-    """Tell the host (Titan) that the media has been removed."""
-    _sysfs_write(f"{GADGET_LUN}/forced_eject", "")
-    # Clear the backing file so the kernel fully drops the device
+    """Tell the host (Titan) the media has been removed and unbind the
+    backing file so we can safely write to it locally.
+    """
+    # forced_eject isn't available on every kernel — tolerate failure
+    try:
+        _sysfs_write(f"{GADGET_LUN}/forced_eject", "")
+    except OSError:
+        pass
     _sysfs_write(f"{GADGET_LUN}/file", "")
-    time.sleep(0.3)
+    time.sleep(EJECT_WAIT_SECONDS)
 
 
 def insert_media():
@@ -80,18 +97,51 @@ def insert_media():
     time.sleep(0.3)
 
 
-def mount_image():
-    """Mount the FAT32 image locally for read/write."""
+# ── Image read helpers (read-only loop mount) ────────────────────────────
+
+def mount_ro():
+    """Mount the FAT32 image read-only. Coexists with the gadget."""
     Path(MOUNT_POINT).mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["mount", "-o", "loop", USB_IMAGE, MOUNT_POINT],
+        ["mount", "-o", "loop,ro", USB_IMAGE, MOUNT_POINT],
         check=True,
     )
 
 
-def unmount_image():
-    """Unmount the FAT32 image."""
+def unmount():
+    """Unmount the image."""
     subprocess.run(["umount", MOUNT_POINT], check=True)
+
+
+# ── Image write helpers (mtools) ─────────────────────────────────────────
+
+def mtools_clear_root():
+    """Delete all files at the root of the USB image.
+
+    Must be called with the gadget ejected (file unbound) so we don't
+    race with the kernel mass_storage cache.
+    """
+    result = subprocess.run(
+        ["mdir", "-b", "-i", USB_IMAGE, "::/"],
+        capture_output=True, text=True, check=False,
+    )
+    for line in result.stdout.splitlines():
+        name = line.strip()
+        if not name.startswith("::"):
+            continue
+        # mdel only removes files; directories are silently skipped
+        subprocess.run(
+            ["mdel", "-i", USB_IMAGE, name],
+            check=False, capture_output=True,
+        )
+
+
+def mtools_copy_to_image(src_path, dest_name):
+    """Copy a local file onto the root of the USB image."""
+    subprocess.run(
+        ["mcopy", "-o", "-i", USB_IMAGE, src_path, f"::/{dest_name}"],
+        check=True,
+    )
 
 
 # ── API routes ───────────────────────────────────────────────────────────
@@ -114,9 +164,9 @@ def status():
 
 @app.route("/api/deploy", methods=["POST"])
 def deploy():
-    """Receive a file, write it to the USB image.
+    """Receive a file, write it to the USB image, re-present to host.
 
-    The cycle: eject → mount → clear old files → write new file → unmount → reinsert.
+    Flow: eject → mtools clear root → mtools copy new file → reinsert.
     """
     if "file" not in request.files:
         return jsonify({"ok": False, "error": "No file uploaded"}), 400
@@ -124,65 +174,50 @@ def deploy():
     uploaded = request.files["file"]
     filename = secure_filename(uploaded.filename or "backup.zip")
 
-    # Validate extension
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        return jsonify({"ok": False, "error": f"Only {ALLOWED_EXTENSIONS} files allowed"}), 400
+        return jsonify({"ok": False, "error": f"Only {sorted(ALLOWED_EXTENSIONS)} files allowed"}), 400
 
-    # Read into memory (bounded)
     file_bytes = uploaded.read(MAX_UPLOAD_BYTES + 1)
     if len(file_bytes) > MAX_UPLOAD_BYTES:
         return jsonify({"ok": False, "error": f"File too large (max {MAX_UPLOAD_BYTES // 1024 // 1024} MB)"}), 400
 
+    # Write the upload to a local temp file so mtools can copy from it
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
     try:
-        # 1) Eject media from Titan
         eject_media()
-
-        # 2) Mount image locally
-        mount_image()
-
-        # 3) Clear existing files on the image
-        for item in Path(MOUNT_POINT).iterdir():
-            if item.is_file():
-                item.unlink()
-            elif item.is_dir():
-                shutil.rmtree(item)
-
-        # 4) Write the new file
-        dest = Path(MOUNT_POINT) / filename
-        dest.write_bytes(file_bytes)
-
-        # 5) Unmount
-        unmount_image()
-
-        # 6) Reinsert media — Titan sees fresh drive
+        mtools_clear_root()
+        mtools_copy_to_image(tmp_path, filename)
         insert_media()
-
         return jsonify({"ok": True, "filename": filename, "size": len(file_bytes)})
 
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode("utf-8", errors="replace") if isinstance(e.stderr, (bytes, bytearray)) else (e.stderr or "")
+        try: insert_media()
+        except Exception: pass
+        return jsonify({"ok": False, "error": f"mtools failed: {stderr.strip() or str(e)}"}), 500
+
     except Exception as e:
-        # Best-effort cleanup
-        try:
-            unmount_image()
-        except Exception:
-            pass
-        try:
-            insert_media()
-        except Exception:
-            pass
+        try: insert_media()
+        except Exception: pass
         return jsonify({"ok": False, "error": str(e)}), 500
+
+    finally:
+        try: os.unlink(tmp_path)
+        except OSError: pass
 
 
 @app.route("/api/backups")
 def list_backups():
     """List files currently on the USB image.
 
-    Ejects, mounts read-only, reads listing, unmounts, reinserts.
+    Uses a read-only loop mount — no eject, Titan keeps seeing the drive.
     """
     try:
-        eject_media()
-        mount_image()
-
+        mount_ro()
         files = []
         for item in sorted(Path(MOUNT_POINT).iterdir()):
             if item.is_file():
@@ -192,48 +227,39 @@ def list_backups():
                     "size": stat.st_size,
                     "modified": stat.st_mtime,
                 })
-
-        unmount_image()
-        insert_media()
-
+        unmount()
         return jsonify({"ok": True, "files": files})
 
     except Exception as e:
-        try:
-            unmount_image()
-        except Exception:
-            pass
-        try:
-            insert_media()
-        except Exception:
-            pass
+        try: unmount()
+        except Exception: pass
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/backup/<filename>")
 def download_backup(filename):
-    """Download a specific file from the USB image."""
+    """Download a specific file from the USB image.
+
+    Uses a read-only loop mount — no eject.
+    """
     filename = secure_filename(filename)
     if not filename:
         return jsonify({"ok": False, "error": "Invalid filename"}), 400
 
     try:
-        eject_media()
-        mount_image()
+        mount_ro()
 
         file_path = Path(MOUNT_POINT) / filename
         if not file_path.is_file():
-            unmount_image()
-            insert_media()
+            unmount()
             return jsonify({"ok": False, "error": "File not found"}), 404
 
-        # Copy to temp location so we can unmount before sending
+        # Copy to a temp location so we can unmount before sending
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1])
         tmp.write(file_path.read_bytes())
         tmp.close()
 
-        unmount_image()
-        insert_media()
+        unmount()
 
         return send_from_directory(
             os.path.dirname(tmp.name),
@@ -243,14 +269,8 @@ def download_backup(filename):
         )
 
     except Exception as e:
-        try:
-            unmount_image()
-        except Exception:
-            pass
-        try:
-            insert_media()
-        except Exception:
-            pass
+        try: unmount()
+        except Exception: pass
         return jsonify({"ok": False, "error": str(e)}), 500
 
 

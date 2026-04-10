@@ -38,30 +38,34 @@ fi
 echo ""
 echo "Installing system packages..."
 sudo apt-get update -qq
-sudo apt-get install -y python3 python3-pip python3-venv dosfstools
+sudo apt-get install -y python3 python3-pip python3-venv dosfstools mtools
 
 # ── 3. Enable USB OTG (dwc2) ─────────────────────────────────────────────
 
 echo ""
 echo "Configuring USB OTG gadget mode..."
 
-# Add dtoverlay=dwc2,dr_mode=peripheral to /boot/config.txt (or /boot/firmware/config.txt on newer OS)
-#
-# Note: dr_mode=peripheral is required — plain `dtoverlay=dwc2` defaults to OTG,
-# and some Raspberry Pi OS images pre-set `dtoverlay=dwc2,dr_mode=host` which
-# prevents gadget mode from working (no UDC in /sys/class/udc). We force peripheral.
+# Configure the dwc2 overlay under an [all] section at the end of the boot
+# config. This is the only reliable way — recent Raspberry Pi OS images ship
+# with `dtoverlay=dwc2,dr_mode=host` pre-set inside a `[cm5]` section, and a
+# naive search-and-replace either doesn't touch it (wrong section match) or
+# corrupts it (replaces a line whose scope matters on other hardware). An
+# `[all]` section at the end applies to every Pi model and overrides anything
+# earlier in the file.
 BOOT_CONFIG="/boot/config.txt"
 [ -f "/boot/firmware/config.txt" ] && BOOT_CONFIG="/boot/firmware/config.txt"
 
-if grep -q "^dtoverlay=dwc2,dr_mode=peripheral" "$BOOT_CONFIG" 2>/dev/null; then
-    echo "  dtoverlay=dwc2,dr_mode=peripheral already set in $BOOT_CONFIG"
-elif grep -q "^dtoverlay=dwc2" "$BOOT_CONFIG" 2>/dev/null; then
-    # An existing dwc2 overlay line is present but has the wrong mode — fix it.
-    echo "  Found existing dtoverlay=dwc2 line with wrong mode — updating to peripheral"
-    sudo sed -i 's|^dtoverlay=dwc2.*|dtoverlay=dwc2,dr_mode=peripheral|' "$BOOT_CONFIG"
+DWC2_MARKER="# BendGen USB Bridge dwc2 overlay"
+if ! grep -qF "$DWC2_MARKER" "$BOOT_CONFIG" 2>/dev/null; then
+    sudo tee -a "$BOOT_CONFIG" > /dev/null <<EOF
+
+$DWC2_MARKER
+[all]
+dtoverlay=dwc2,dr_mode=peripheral
+EOF
+    echo "  Appended [all] dtoverlay=dwc2,dr_mode=peripheral to $BOOT_CONFIG"
 else
-    echo "dtoverlay=dwc2,dr_mode=peripheral" | sudo tee -a "$BOOT_CONFIG" > /dev/null
-    echo "  Added dtoverlay=dwc2,dr_mode=peripheral to $BOOT_CONFIG"
+    echo "  dwc2 peripheral overlay already present in $BOOT_CONFIG"
 fi
 
 # Add dwc2 to /etc/modules if not present
