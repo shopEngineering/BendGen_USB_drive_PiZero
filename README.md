@@ -71,11 +71,22 @@ When you click "Deploy" in BendGen:
    ```
    (Accept the fingerprint, enter your password)
 
-3. **Download and run the installer:**
+3. **Download and run the installer.** Either option works:
+
+   **Option A — one-liner (no git required):**
    ```bash
    curl -sSL https://raw.githubusercontent.com/shopEngineering/BendGen_USB_drive_PiZero/master/install.sh -o install.sh
    bash install.sh
    ```
+   The installer will fetch `bridge.py` from GitHub automatically.
+
+   **Option B — clone the repo (easier to update later):**
+   ```bash
+   git clone https://github.com/shopEngineering/BendGen_USB_drive_PiZero.git
+   cd BendGen_USB_drive_PiZero
+   bash install.sh
+   ```
+   To update later: `git pull && sudo systemctl restart usb-bridge`
 
 4. **Reboot when prompted.** The bridge starts automatically on boot.
 

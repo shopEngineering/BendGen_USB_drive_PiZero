@@ -9,6 +9,7 @@ INSTALL_DIR="$HOME/usb-drive-bridge"
 SERVICE_NAME="usb-bridge"
 IMAGE_PATH="/piusb.bin"
 IMAGE_SIZE_MB=512
+REPO_RAW_URL="https://raw.githubusercontent.com/shopEngineering/BendGen_USB_drive_PiZero/master"
 
 echo "=== USB Drive Bridge Installer ==="
 echo "This sets up your Pi Zero W as a USB drive bridge."
@@ -44,15 +45,23 @@ sudo apt-get install -y python3 python3-pip python3-venv dosfstools
 echo ""
 echo "Configuring USB OTG gadget mode..."
 
-# Add dtoverlay=dwc2 to /boot/config.txt (or /boot/firmware/config.txt on newer OS)
+# Add dtoverlay=dwc2,dr_mode=peripheral to /boot/config.txt (or /boot/firmware/config.txt on newer OS)
+#
+# Note: dr_mode=peripheral is required — plain `dtoverlay=dwc2` defaults to OTG,
+# and some Raspberry Pi OS images pre-set `dtoverlay=dwc2,dr_mode=host` which
+# prevents gadget mode from working (no UDC in /sys/class/udc). We force peripheral.
 BOOT_CONFIG="/boot/config.txt"
 [ -f "/boot/firmware/config.txt" ] && BOOT_CONFIG="/boot/firmware/config.txt"
 
-if ! grep -q "^dtoverlay=dwc2" "$BOOT_CONFIG" 2>/dev/null; then
-    echo "dtoverlay=dwc2" | sudo tee -a "$BOOT_CONFIG" > /dev/null
-    echo "  Added dtoverlay=dwc2 to $BOOT_CONFIG"
+if grep -q "^dtoverlay=dwc2,dr_mode=peripheral" "$BOOT_CONFIG" 2>/dev/null; then
+    echo "  dtoverlay=dwc2,dr_mode=peripheral already set in $BOOT_CONFIG"
+elif grep -q "^dtoverlay=dwc2" "$BOOT_CONFIG" 2>/dev/null; then
+    # An existing dwc2 overlay line is present but has the wrong mode — fix it.
+    echo "  Found existing dtoverlay=dwc2 line with wrong mode — updating to peripheral"
+    sudo sed -i 's|^dtoverlay=dwc2.*|dtoverlay=dwc2,dr_mode=peripheral|' "$BOOT_CONFIG"
 else
-    echo "  dtoverlay=dwc2 already in $BOOT_CONFIG"
+    echo "dtoverlay=dwc2,dr_mode=peripheral" | sudo tee -a "$BOOT_CONFIG" > /dev/null
+    echo "  Added dtoverlay=dwc2,dr_mode=peripheral to $BOOT_CONFIG"
 fi
 
 # Add dwc2 to /etc/modules if not present
@@ -83,9 +92,28 @@ echo ""
 echo "Installing USB Drive Bridge..."
 mkdir -p "$INSTALL_DIR"
 
-# Copy bridge files
-cp "$(dirname "$0")/bridge.py" "$INSTALL_DIR/"
-cp "$(dirname "$0")/requirements.txt" "$INSTALL_DIR/" 2>/dev/null || true
+# Copy bridge files — use local copies if present (git clone / scp flow),
+# otherwise fetch from GitHub (curl one-liner flow).
+SCRIPT_DIR="$(dirname "$0")"
+fetch_file() {
+    local name="$1"
+    local required="$2"
+    if [ -f "$SCRIPT_DIR/$name" ]; then
+        echo "  Using local $name"
+        cp "$SCRIPT_DIR/$name" "$INSTALL_DIR/"
+    else
+        echo "  Downloading $name from GitHub..."
+        if ! curl -sSL --fail "$REPO_RAW_URL/$name" -o "$INSTALL_DIR/$name"; then
+            if [ "$required" = "yes" ]; then
+                echo "ERROR: Failed to download $name from $REPO_RAW_URL/$name"
+                exit 1
+            fi
+        fi
+    fi
+}
+
+fetch_file bridge.py yes
+fetch_file requirements.txt no
 
 # Create venv and install dependencies
 python3 -m venv "$INSTALL_DIR/venv"
