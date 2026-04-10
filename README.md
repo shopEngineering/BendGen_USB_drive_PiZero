@@ -177,11 +177,41 @@ Your bridge address would be `192.168.1.42:8080`
 - Is it a data cable? Charge-only cables won't work
 - Check: `sudo systemctl status usb-gadget`
 - Check: `lsmod | grep dwc2`
+- Check: `ls /sys/class/udc` — should list something like `20980000.usb`
+
+### `usb-gadget.service` fails at boot with "No USB device controller found"
+This means `dwc2` is loaded but the USB Device Controller isn't being
+created, usually because the overlay is in the wrong mode or scoped to
+the wrong Pi model. Recent Raspberry Pi OS images ship with
+`dtoverlay=dwc2,dr_mode=host` pre-set inside a `[cm5]` section, which
+doesn't apply to a Pi Zero W and also forces host mode (not peripheral).
+Current `install.sh` handles this automatically by appending an `[all]`
+section, but if you installed before that fix or edited the config by
+hand, do this:
+
+```bash
+# Check what's currently in the config
+grep -n -B2 -A1 dwc2 /boot/firmware/config.txt
+
+# Append an [all] section that forces peripheral mode (idempotent — run as often as you like)
+grep -q "# BendGen USB Bridge dwc2 overlay" /boot/firmware/config.txt || \
+  sudo tee -a /boot/firmware/config.txt > /dev/null <<'EOF'
+
+# BendGen USB Bridge dwc2 overlay
+[all]
+dtoverlay=dwc2,dr_mode=peripheral
+EOF
+
+sudo reboot
+```
+
+After reboot, `ls /sys/class/udc` should show a controller, and both
+`usb-gadget` and `usb-bridge` services should come up clean.
 
 ### Titan doesn't see the USB drive
 - Try a different USB cable (data cable, not charge-only)
 - Try a different USB port on the Titan
-- Check: `cat /sys/kernel/config/usb_gadget/g1/UDC`
+- Check: `cat /sys/kernel/config/usb_gadget/g1/UDC` — should show a device controller name
 - Reboot the Pi with the USB cable connected
 
 ### Viewing logs
